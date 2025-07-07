@@ -14,6 +14,7 @@ find_package(Eigen3 REQUIRED)
 find_package(OpenMP)
 find_package(PCL REQUIRED COMPONENTS io registration)
 find_package(pcl_conversions REQUIRED)
+find_package(autoware_internal_debug_msgs REQUIRED)
 
 include_directories(
   include
@@ -34,6 +35,7 @@ ament_target_dependencies(small_gicp_ros2
   tf2
   tf2_ros
   Eigen3
+  autoware_internal_debug_msgs
 )
 
 target_link_libraries(small_gicp_ros2
