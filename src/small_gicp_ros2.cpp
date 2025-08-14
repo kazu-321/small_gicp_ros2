@@ -13,11 +13,12 @@
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/registration/registration.hpp>
 
-
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
+#include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 
 #define TARGET_TOPIC "/localization/util/downsample/pointcloud"
+// #define PCD_FILE "/home/kazusahashimoto/autoware_map/sample-map-rosbag/pointcloud_map.pcd"
 #define PCD_FILE "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd"
 using namespace small_gicp;
 
@@ -31,40 +32,45 @@ public:
     pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/localization/pose_with_covariance",
       rclcpp::SensorDataQoS(),
-      [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
-        initial_pose_ = msg->pose.pose;
-      });
-      
-      inlier_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/inlier_count", 10);
-      diff_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("small_gicp/diff", 10);
-      
-      tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
-      if (pcl::io::loadPCDFile<pcl::PointXYZ>(PCD_FILE, *target_cloud_) == -1) {
-        RCLCPP_ERROR(this->get_logger(), "Couldn't read source PCD file");
-        throw std::runtime_error("Failed to load source PCD file");
-      }
-      RCLCPP_INFO(this->get_logger(), "Loaded target PCD file successfully");
-      // Convert target cloud to vector of Eigen::Vector3f
-      for (const auto& point : target_cloud_->points) {
-        Eigen::Vector3f vec(point.x, point.y, point.z);
-        target_points_.push_back(vec);
-      }
-      RCLCPP_INFO(this->get_logger(), "Converted target PCD to Eigen::Vector3f");
-      num_threads = 4;                                       // Number of threads to be used
-      downsampling_resolution = 0.5;                        // Downsampling resolution
-      num_neighbors = 10;                                    // Number of neighbor points used for normal and covariance estimation
-      max_correspondence_distance = 1.0;                     // Maximum correspondence distance between points (e.g., triming threshold)
-      init_T_target_source = Eigen::Isometry3d::Identity();  // Initial transformation from target to source
-      target = std::make_shared<PointCloud>(target_points_);
-      target = voxelgrid_sampling_omp(*target, downsampling_resolution, num_threads);
-      target_tree = std::make_shared<KdTree<PointCloud>>(target, KdTreeBuilderOMP(num_threads));
-      estimate_covariances_omp(*target, *target_tree, num_neighbors, num_threads);
-      RCLCPP_INFO(this->get_logger(), "Estimated point covariances for target cloud");
+      [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) { initial_pose_ = msg->pose.pose; });
+
+    inlier_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/inlier_count", 10);
+    iter_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/iteration_count", 10);
+    error_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Float32Stamped>("small_gicp/error", 10);
+    diff_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("small_gicp/diff_fixed", 10);
+
+    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(PCD_FILE, *target_cloud_) == -1) {
+      RCLCPP_ERROR(this->get_logger(), "Couldn't read source PCD file");
+      throw std::runtime_error("Failed to load source PCD file");
     }
-    
-    
-    void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    // init_T_target_source Isometry3d
+    RCLCPP_INFO(this->get_logger(), "Loaded target PCD file successfully");
+    // Convert target cloud to vector of Eigen::Vector3f
+    for (const auto& point : target_cloud_->points) {
+      Eigen::Vector3f vec(point.x, point.y, point.z);
+      target_points_.push_back(vec);
+    }
+    RCLCPP_INFO(this->get_logger(), "Converted target PCD to Eigen::Vector3f");
+    num_threads = 4;                                       // Number of threads to be used
+    downsampling_resolution = 0.5;                         // Downsampling resolution
+    num_neighbors = 10;                                    // Number of neighbor points used for normal and covariance estimation
+    max_correspondence_distance = 1.0;                     // Maximum correspondence distance between points (e.g., triming threshold)
+    init_T_target_source = Eigen::Isometry3d::Identity();  // Initial transformation from target to source
+    target = std::make_shared<PointCloud>(target_points_);
+    target = voxelgrid_sampling_omp(*target, downsampling_resolution, num_threads);
+    target_tree = std::make_shared<KdTree<PointCloud>>(target, KdTreeBuilderOMP(num_threads));
+    estimate_covariances_omp(*target, *target_tree, num_neighbors, num_threads);
+    RCLCPP_INFO(this->get_logger(), "Estimated point covariances for target cloud");
+
+    this->declare_parameter("mask_x", 1.0);
+    this->declare_parameter("mask_y", 1.0);
+    this->declare_parameter("mask_z", 1.0);
+    this->declare_parameter("mask_yaw", 1.0);
+    this->declare_parameter("max_iterations", 50);
+  }
+
+  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    initial_pose_.position.x += 1.0;
     init_T_target_source.translation() = Eigen::Vector3d(initial_pose_.position.x, initial_pose_.position.y, initial_pose_.position.z);
     init_T_target_source.linear() =
       Eigen::Quaterniond(initial_pose_.orientation.w, initial_pose_.orientation.x, initial_pose_.orientation.y, initial_pose_.orientation.z).toRotationMatrix();
@@ -95,22 +101,27 @@ public:
     // Estimate point covariances
     estimate_covariances_omp(*source, *source_tree, num_neighbors, num_threads);
 
-    // RCLCPP_INFO(this->get_logger(), "Estimated point covariances");
+    RCLCPP_INFO(this->get_logger(), "Estimated point covariances");
 
     // GICP + OMP-based parallel reduction
     Registration<GICPFactor, ParallelReductionOMP, RestrictDoFFactor> registration;
     registration.reduction.num_threads = num_threads;
     registration.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
-    registration.criteria.translation_eps = 1e-5;
-    registration.general_factor.set_rotation_mask(Eigen::Vector3d(0, 0, 0.1));  // Set rotation mask to allow only yaw rotation
-    registration.general_factor.set_translation_mask(Eigen::Vector3d(0.1, 0.1, 0.1));  // Allow translation in all directions
-    registration.optimizer.max_iterations = 40;
+    registration.criteria.translation_eps = 0.001;
+    this->get_parameter("mask_x", mask_x);
+    this->get_parameter("mask_y", mask_y);
+    this->get_parameter("mask_z", mask_z);
+    this->get_parameter("mask_yaw", mask_yaw);
+    registration.general_factor.set_translation_mask(Eigen::Vector3d(mask_x, mask_y, mask_z));  // Set translation mask
+    registration.general_factor.set_rotation_mask(Eigen::Vector3d(0, 0, mask_yaw));             // Set rotation mask
+    this->get_parameter("max_iterations", max_iterations);
+    registration.optimizer.max_iterations = max_iterations;
 
     // Align point clouds
 
     auto result = registration.align(*target, *source, *target_tree, init_T_target_source);
 
-    // RCLCPP_INFO(this->get_logger(), "Aligned point clouds");
+    RCLCPP_INFO(this->get_logger(), "Aligned point clouds");
 
     // Publish pose
     // result.H = Final Hessian matrix (6x6)
@@ -125,6 +136,23 @@ public:
     pose_msg.pose.pose.orientation.y = q.y();
     pose_msg.pose.pose.orientation.z = q.z();
     pose_msg.pose.pose.orientation.w = q.w();
+
+    // covariance matrix
+    // [
+    //   0.0225, 0.0,   0.0,   0.0,      0.0,      0.0,
+    //   0.0,   0.0225, 0.0,   0.0,      0.0,      0.0,
+    //   0.0,   0.0,   0.0225, 0.0,      0.0,      0.0,
+    //   0.0,   0.0,   0.0,   0.000625, 0.0,      0.0,
+    //   0.0,   0.0,   0.0,   0.0,      0.000625, 0.0,
+    //   0.0,   0.0,   0.0,   0.0,      0.0,      0.000625,
+    // ]
+
+    pose_msg.pose.covariance[0] = 0.0225;  // x position variance
+    pose_msg.pose.covariance[7] = 0.0225;  // y position variance
+    pose_msg.pose.covariance[14] = 0.0225; // z position variance
+    pose_msg.pose.covariance[21] = 0.000625; // x orientation variance
+    pose_msg.pose.covariance[28] = 0.000625; // y orientation variance
+    pose_msg.pose.covariance[35] = 0.000625; // z orientation variance
 
     pose_publisher_->publish(pose_msg);
 
@@ -153,21 +181,35 @@ public:
     inlier_msg.data = result.num_inliers;
     inlier_pub_->publish(inlier_msg);
 
+    // Publish iteration count
+    autoware_internal_debug_msgs::msg::Int32Stamped iter_msg;
+    iter_msg.stamp = this->now();
+    iter_msg.data = result.iterations;
+    iter_pub_->publish(iter_msg);
+
+    // Publish error
+    autoware_internal_debug_msgs::msg::Float32Stamped error_msg;
+    error_msg.stamp = this->now();
+    error_msg.data = result.error;
+    error_pub_->publish(error_msg);
+
+    if (!result.converged) {
+      RCLCPP_WARN(this->get_logger(), "Small GICP did not converge");
+    }
+
     // Publish difference
     geometry_msgs::msg::TwistStamped diff_msg;
     diff_msg.header.stamp = this->now();
     diff_msg.header.frame_id = "small_gicp";
-    diff_msg.twist.linear.x = result.T_target_source.translation().x() - initial_pose_.position.x;
-    diff_msg.twist.linear.y = result.T_target_source.translation().y() - initial_pose_.position.y;
-    diff_msg.twist.linear.z = result.T_target_source.translation().z() - initial_pose_.position.z;
-    Eigen::Quaterniond initial_q(initial_pose_.orientation.w,
-                                 initial_pose_.orientation.x,
-                                 initial_pose_.orientation.y,
-                                 initial_pose_.orientation.z);
-    Eigen::Quaterniond diff_q(result.T_target_source.rotation() * initial_q.inverse());
-    diff_msg.twist.angular.z = std::atan2(2.0 * (diff_q.w() * diff_q.z() + diff_q.x() * diff_q.y()), 1.0 - 2.0 * (diff_q.y() * diff_q.y() + diff_q.z() * diff_q.z()));
-      diff_msg.twist.angular.x = 0.0;  // Assuming no roll
-    diff_msg.twist.angular.y = 0.0;  // Assuming no pitch
+    double diff_position_x = result.T_target_source.translation().x() - initial_pose_.position.x;
+    double diff_position_y = result.T_target_source.translation().y() - initial_pose_.position.y;
+    double diff_position_z = result.T_target_source.translation().z() - initial_pose_.position.z;
+    double result_yaw = std::atan2(result.T_target_source.rotation().matrix()(1, 0), result.T_target_source.rotation().matrix()(0, 0)) - M_PI;
+
+    // map基準のdiffなのでsmall_gicp用に回転させる
+    diff_msg.twist.linear.x = diff_position_x * std::cos(result_yaw) + diff_position_y * std::sin(result_yaw);
+    diff_msg.twist.linear.y = -diff_position_x * std::sin(result_yaw) + diff_position_y * std::cos(result_yaw);
+    diff_msg.twist.linear.z = diff_position_z;
     diff_pub_->publish(diff_msg);
   }
 
@@ -175,6 +217,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_publisher_;
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr inlier_pub_;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr iter_pub_;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr error_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr diff_pub_;
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> target_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   std::vector<Eigen::Vector3f> target_points_;
@@ -190,6 +234,12 @@ private:
   std::shared_ptr<PointCloud> target;
   std::shared_ptr<KdTree<PointCloud>> target_tree;
   geometry_msgs::msg::Pose initial_pose_;
+
+  double mask_x = 0.9999;   // Mask for x translation
+  double mask_y = 0.9999;   // Mask for y translation
+  double mask_z = 0.3;      // Mask for z translation (allowing some vertical movement)
+  double mask_yaw = 0.3;    // Mask for yaw rotation (allowing some rotation around z-axis)
+  int max_iterations = 50;  // Maximum iterations for the registration
 };
 
 int main(int argc, char** argv) {
