@@ -19,7 +19,8 @@
 
 #define TARGET_TOPIC "/localization/util/downsample/pointcloud"
 // #define PCD_FILE "/home/kazusahashimoto/autoware_map/sample-map-rosbag/pointcloud_map.pcd"
-#define PCD_FILE "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd"
+// #define PCD_FILE "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd"
+// #define PCD_FILE "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/output.pcd"
 using namespace small_gicp;
 
 class SmallGICPNode : public rclcpp::Node {
@@ -38,6 +39,9 @@ public:
     iter_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/iteration_count", 10);
     error_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Float32Stamped>("small_gicp/error", 10);
     diff_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("small_gicp/diff_fixed", 10);
+    this->declare_parameter("pcd_file", "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd");
+    this->declare_parameter("downsampling_resolution", 0.05);
+    std::string PCD_FILE = this->get_parameter("pcd_file").as_string();
 
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     if (pcl::io::loadPCDFile<pcl::PointXYZ>(PCD_FILE, *target_cloud_) == -1) {
@@ -52,7 +56,7 @@ public:
     }
     RCLCPP_INFO(this->get_logger(), "Converted target PCD to Eigen::Vector3f");
     num_threads = 4;                                       // Number of threads to be used
-    downsampling_resolution = 0.5;                         // Downsampling resolution
+    downsampling_resolution = this->get_parameter("downsampling_resolution").as_double(); // m
     num_neighbors = 10;                                    // Number of neighbor points used for normal and covariance estimation
     max_correspondence_distance = 1.0;                     // Maximum correspondence distance between points (e.g., triming threshold)
     init_T_target_source = Eigen::Isometry3d::Identity();  // Initial transformation from target to source
@@ -61,16 +65,10 @@ public:
     target_tree = std::make_shared<KdTree<PointCloud>>(target, KdTreeBuilderOMP(num_threads));
     estimate_covariances_omp(*target, *target_tree, num_neighbors, num_threads);
     RCLCPP_INFO(this->get_logger(), "Estimated point covariances for target cloud");
-
-    this->declare_parameter("mask_x", 1.0);
-    this->declare_parameter("mask_y", 1.0);
-    this->declare_parameter("mask_z", 1.0);
-    this->declare_parameter("mask_yaw", 1.0);
     this->declare_parameter("max_iterations", 50);
   }
 
   void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    initial_pose_.position.x += 1.0;
     init_T_target_source.translation() = Eigen::Vector3d(initial_pose_.position.x, initial_pose_.position.y, initial_pose_.position.z);
     init_T_target_source.linear() =
       Eigen::Quaterniond(initial_pose_.orientation.w, initial_pose_.orientation.x, initial_pose_.orientation.y, initial_pose_.orientation.z).toRotationMatrix();
@@ -107,13 +105,7 @@ public:
     Registration<GICPFactor, ParallelReductionOMP, RestrictDoFFactor> registration;
     registration.reduction.num_threads = num_threads;
     registration.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
-    registration.criteria.translation_eps = 0.001;
-    this->get_parameter("mask_x", mask_x);
-    this->get_parameter("mask_y", mask_y);
-    this->get_parameter("mask_z", mask_z);
-    this->get_parameter("mask_yaw", mask_yaw);
-    registration.general_factor.set_translation_mask(Eigen::Vector3d(mask_x, mask_y, mask_z));  // Set translation mask
-    registration.general_factor.set_rotation_mask(Eigen::Vector3d(0, 0, mask_yaw));             // Set rotation mask
+    registration.criteria.translation_eps = 0.0001;
     this->get_parameter("max_iterations", max_iterations);
     registration.optimizer.max_iterations = max_iterations;
 
@@ -234,11 +226,6 @@ private:
   std::shared_ptr<PointCloud> target;
   std::shared_ptr<KdTree<PointCloud>> target_tree;
   geometry_msgs::msg::Pose initial_pose_;
-
-  double mask_x = 0.9999;   // Mask for x translation
-  double mask_y = 0.9999;   // Mask for y translation
-  double mask_z = 0.3;      // Mask for z translation (allowing some vertical movement)
-  double mask_yaw = 0.3;    // Mask for yaw rotation (allowing some rotation around z-axis)
   int max_iterations = 50;  // Maximum iterations for the registration
 };
 
