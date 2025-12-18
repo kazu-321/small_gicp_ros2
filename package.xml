@@ -19,6 +19,7 @@
 
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
   <!-- optional -->
   <!-- <depend>libpcl-all-dev</depend> -->
   <!-- <depend>tbb</depend> -->

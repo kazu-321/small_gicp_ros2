@@ -55,6 +55,9 @@ struct GaussNewtonOptimizer {
       result.H = H;
       result.b = b;
       result.error = e;
+
+      result.error_history.push_back(e);
+      result.T_target_source_history.push_back(result.T_target_source);
     }
 
     result.num_inliers = std::count_if(factors.begin(), factors.end(), [](const auto& factor) { return factor.inlier(); });
@@ -112,6 +115,9 @@ struct LevenbergMarquardtOptimizer {
         const Eigen::Isometry3d new_T = result.T_target_source * se3_exp(delta);
         double new_e = reduction.error(target, source, new_T, factors);
         general_factor.update_error(target, source, new_T, &e);
+
+        result.error_history.push_back(new_e);
+        result.T_target_source_history.push_back(new_T);
 
         if (verbose) {
           std::cout << "iter=" << i << " inner=" << j << " e=" << e << " new_e=" << new_e << " lambda=" << lambda << " dt=" << delta.tail<3>().norm()

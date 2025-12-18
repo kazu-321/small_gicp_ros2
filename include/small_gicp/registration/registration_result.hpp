@@ -27,6 +27,9 @@ struct RegistrationResult {
   Eigen::Matrix<double, 6, 6> H;  ///< Final information matrix
   Eigen::Matrix<double, 6, 1> b;  ///< Final information vector
   double error;                   ///< Final error
+
+  std::vector<Eigen::Isometry3d> T_target_source_history;  ///< History of estimated transformations
+  std::vector<double> error_history;                      ///< History of inlier counts
 };
 
 }  // namespace small_gicp
