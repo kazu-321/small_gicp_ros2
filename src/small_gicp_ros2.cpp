@@ -36,7 +36,7 @@ public:
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("small_gicp/markers", 10);
 
-    // std::string PCD_FILE = this->declare_parameter("pcd_file", "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd");
+    std::string PCD_FILE = this->declare_parameter("pcd_file", "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd");
     double voxel_resolution = this->declare_parameter("voxel_resolution", 2.0);
     int num_threads = this->declare_parameter("num_threads", 4);
     int max_iterations = this->declare_parameter("max_iterations", 50);
@@ -50,7 +50,7 @@ public:
     small_gicp->setTransformationEpsilon(transformation_epsilon);
     // small_gicp->setRotationEpsilon(0.0);
     small_gicp->setRegistrationType("VGICP");
-    // small_gicp->setVerbosity(true);
+    small_gicp->setVerbosity(true);
 
     source_pointcloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/localization/util/downsample/pointcloud",
@@ -58,7 +58,7 @@ public:
       std::bind(&SmallGICPNode::pointcloud_callback, this, std::placeholders::_1));
 
     target_pointcloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/localization/pose_estimator/debug/loaded_pointcloud_map",
+      "/localization/pose_estimator/debug/loaded_pointcloud_map_raw",
       1,
       [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
@@ -75,6 +75,15 @@ public:
           small_gicp->align(*aligned, initial_pose_);  // 初回の重い処理を回避するためにダミーで実行
         }
       });
+
+    // if (pcl::io::loadPCDFile<pcl::PointXYZ>(PCD_FILE, *target_cloud_) == -1) {
+    //   RCLCPP_ERROR(this->get_logger(), "Couldn't read target PCD file: %s", PCD_FILE.c_str());
+    //   throw std::runtime_error("Failed to load target PCD file");
+    // }
+    // RCLCPP_INFO(this->get_logger(), "Loaded target PCD file: %s", PCD_FILE.c_str());
+
+    // small_gicp->setInputTarget(target_cloud_);
+
 
     pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/localization/pose_with_covariance",
@@ -95,7 +104,7 @@ private:
 
   void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     if (!initial_pose_received_) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Waiting for initial pose...");
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, "Waiting for initial pose...");
       return;
     }
 
@@ -105,6 +114,8 @@ private:
       return;
     }
 
+    RCLCPP_INFO(this->get_logger(), "Starting Small GICP alignment...");
+
     pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
     pcl::fromROSMsg(*msg, pcl_cloud);
 
@@ -112,16 +123,16 @@ private:
     pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>());
     small_gicp->align(*aligned, initial_pose_);
 
-    auto result = small_gicp->getRegistrationResult();
-    Eigen::Matrix4f result_small_gicp = small_gicp->getFinalTransformation();
+    const auto& result = small_gicp->getRegistrationResult();
+    const Eigen::Isometry3d& T_result = result.T_target_source;
 
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
     pose_msg.header.stamp = this->now();
     pose_msg.header.frame_id = "map";
-    pose_msg.pose.pose.position.x = result_small_gicp(0, 3);
-    pose_msg.pose.pose.position.y = result_small_gicp(1, 3);
-    pose_msg.pose.pose.position.z = result_small_gicp(2, 3);
-    Eigen::Quaternionf q_out(result_small_gicp.block<3, 3>(0, 0));
+    pose_msg.pose.pose.position.x = T_result.translation().x();
+    pose_msg.pose.pose.position.y = T_result.translation().y();
+    pose_msg.pose.pose.position.z = T_result.translation().z();
+    Eigen::Quaterniond q_out(T_result.rotation());
     pose_msg.pose.pose.orientation.x = q_out.x();
     pose_msg.pose.pose.orientation.y = q_out.y();
     pose_msg.pose.pose.orientation.z = q_out.z();
