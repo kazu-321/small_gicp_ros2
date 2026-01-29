@@ -5,15 +5,25 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 
-#include <small_gicp/ann/kdtree_omp.hpp>
-#include <small_gicp/points/point_cloud.hpp>
+// #include <small_gicp/ann/kdtree_omp.hpp>
+// #include <small_gicp/points/point_cloud.hpp>
+// #include <small_gicp/factors/gicp_factor.hpp>
+// #include <small_gicp/factors/general_factor.hpp>
+// #include <small_gicp/util/downsampling_omp.hpp>
+// #include <small_gicp/util/normal_estimation_omp.hpp>
+// #include <small_gicp/registration/reduction_omp.hpp>
+// #include <small_gicp/registration/registration.hpp>
+// #include "small_gicp/pcl/pcl_registration.hpp"
+
+
 #include <small_gicp/factors/gicp_factor.hpp>
-#include <small_gicp/factors/general_factor.hpp>
-#include <small_gicp/util/downsampling_omp.hpp>
+#include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/ann/kdtree_omp.hpp>
+#include <small_gicp/ann/gaussian_voxelmap.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/registration/registration.hpp>
-#include "small_gicp/pcl/pcl_registration.hpp"
+
 
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
@@ -27,6 +37,20 @@ using namespace small_gicp;
 class SmallGICPNode : public rclcpp::Node {
 public:
   SmallGICPNode() : Node("small_gicp_node") {
+    voxel_resolution = this->declare_parameter("voxel_resolution", 1.0);
+    num_threads = this->declare_parameter("num_threads", 4);
+    max_iterations = this->declare_parameter("max_iterations", 50);
+    transformation_epsilon = this->declare_parameter("transformation_epsilon", 0.0001);
+    num_neighbors = this->declare_parameter("num_neighbors", 20);
+    downsampling_resolution = this->declare_parameter("downsampling_resolution", 0.25);
+    max_correspondence_distance = this->declare_parameter("max_correspondence_distance", 1.0);
+
+    // Initialize GICP parameters
+    small_gicp.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
+    small_gicp.reduction.num_threads = num_threads;
+    small_gicp.optimizer.max_iterations = max_iterations;
+    small_gicp.criteria.translation_eps = transformation_epsilon;
+
     // Publishers
     pose_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("small_gicp/pose", 10);
     pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("small_gicp/pointcloud", 10);
@@ -35,22 +59,6 @@ public:
     error_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Float32Stamped>("small_gicp/error", 10);
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("small_gicp/markers", 10);
-
-    std::string PCD_FILE = this->declare_parameter("pcd_file", "/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/map.pcd");
-    double voxel_resolution = this->declare_parameter("voxel_resolution", 2.0);
-    int num_threads = this->declare_parameter("num_threads", 4);
-    int max_iterations = this->declare_parameter("max_iterations", 50);
-    double transformation_epsilon = this->declare_parameter("transformation_epsilon", 0.0001);
-
-    small_gicp = RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ>::Ptr(new RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ>());
-
-    small_gicp->setVoxelResolution(voxel_resolution);
-    small_gicp->setNumThreads(num_threads);
-    small_gicp->setMaximumIterations(max_iterations);
-    small_gicp->setTransformationEpsilon(transformation_epsilon);
-    // small_gicp->setRotationEpsilon(0.0);
-    small_gicp->setRegistrationType("VGICP");
-    small_gicp->setVerbosity(true);
 
     source_pointcloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/localization/util/downsample/pointcloud",
@@ -61,29 +69,21 @@ public:
       "/localization/pose_estimator/debug/loaded_pointcloud_map_raw",
       1,
       [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        target_points = std::make_shared<PointCloud>();
         pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
         pcl::fromROSMsg(*msg, pcl_cloud);
-        small_gicp->setInputTarget(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>(pcl_cloud));
-        RCLCPP_INFO(this->get_logger(), "Updated target pointcloud with %zu points", pcl_cloud.size());
-        if (!initial_pose_received_) {
-          small_gicp->setInputSource(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>(pcl_cloud));
-          pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>());
-          initial_pose_ = Eigen::Matrix4f::Identity();
-          initial_pose_(0, 3) = pcl_cloud.points[0].x;
-          initial_pose_(1, 3) = pcl_cloud.points[0].y;
-          initial_pose_(2, 3) = pcl_cloud.points[0].z;
-          small_gicp->align(*aligned, initial_pose_);  // 初回の重い処理を回避するためにダミーで実行
+        for (const auto& point : pcl_cloud.points) {
+          target_points->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
         }
+        auto target_tree = std::make_shared<KdTree<PointCloud>>(target_points, KdTreeBuilderOMP(num_threads));
+        estimate_covariances_omp(*target_points, *target_tree, num_neighbors, num_threads);
+        
+        // Build voxel map for VGICP
+        target_voxelmap = std::make_shared<GaussianVoxelMap>(voxel_resolution);
+        target_voxelmap->insert(*target_points);
+
+        RCLCPP_INFO(this->get_logger(), "Loaded target pointcloud with %zu points into voxelmap", target_points->points.size());
       });
-
-    // if (pcl::io::loadPCDFile<pcl::PointXYZ>(PCD_FILE, *target_cloud_) == -1) {
-    //   RCLCPP_ERROR(this->get_logger(), "Couldn't read target PCD file: %s", PCD_FILE.c_str());
-    //   throw std::runtime_error("Failed to load target PCD file");
-    // }
-    // RCLCPP_INFO(this->get_logger(), "Loaded target PCD file: %s", PCD_FILE.c_str());
-
-    // small_gicp->setInputTarget(target_cloud_);
-
 
     pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/localization/pose_with_covariance",
@@ -116,14 +116,47 @@ private:
 
     RCLCPP_INFO(this->get_logger(), "Starting Small GICP alignment...");
 
+    PointCloud::Ptr source_points(new PointCloud());
     pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
     pcl::fromROSMsg(*msg, pcl_cloud);
+    for (const auto& point : pcl_cloud.points) {
+      source_points->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+    }
 
-    small_gicp->setInputSource(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>(pcl_cloud));
-    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>());
-    small_gicp->align(*aligned, initial_pose_);
+    // Validate source pointcloud
+    if (source_points->points.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Source pointcloud is empty");
+      return;
+    }
 
-    const auto& result = small_gicp->getRegistrationResult();
+    auto tree = std::make_shared<KdTree<PointCloud>>(source_points, KdTreeBuilderOMP(num_threads));
+    if (!tree) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to create KdTree for source points");
+      return;
+    }
+    estimate_covariances_omp(*source_points, *tree, num_neighbors, num_threads);
+
+    RCLCPP_INFO(this->get_logger(), "Source pointcloud has %zu points", source_points->points.size());
+
+    Eigen::Isometry3d initial_pose_isometry = Eigen::Isometry3d(initial_pose_.cast<double>());
+
+    if (!target_points || !target_voxelmap) {
+      RCLCPP_WARN(this->get_logger(), "Target voxelmap not yet received");
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Aligning pointclouds with VGICP...");
+    try {
+      // Perform VGICP alignment: point cloud to voxel map
+      auto result = small_gicp.align(*target_voxelmap, *source_points, *target_voxelmap, initial_pose_isometry);
+      RCLCPP_INFO(this->get_logger(), "Alignment complete.");
+      
+      // Validate result
+      if (!std::isfinite(result.error) || result.num_inliers == 0) {
+        RCLCPP_WARN(this->get_logger(), "Alignment produced invalid result - error: %f, inliers: %zu", result.error, result.num_inliers);
+        return;
+      }
+
     const Eigen::Isometry3d& T_result = result.T_target_source;
 
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
@@ -195,10 +228,15 @@ private:
 
     double max_error = 0;
     double min_error = 1e9;
-    for (const auto& error : result.error_history) {
-      if (error > max_error) max_error = error;
-      if (error < min_error) min_error = error;
-    }
+    
+    // Check if history vectors are populated
+    if (result.error_history.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Error history is empty, skipping trajectory visualization");
+    } else {
+      for (const auto& error : result.error_history) {
+        if (error > max_error) max_error = error;
+        if (error < min_error) min_error = error;
+      }
 
     for (const auto& T : result.T_target_source_history) {
       visualization_msgs::msg::Marker marker;
@@ -221,16 +259,24 @@ private:
       marker.scale.y = 0.01;
       marker.scale.z = 0.01;
 
-      double error = result.error_history[marker.id];
-      double error_ratio = (error - min_error) / (max_error - min_error + 1e-5);
-      marker.color.a = 1.0;
-      marker.color.r = 1.0 - error_ratio;
-      marker.color.g = 0.0;
-      marker.color.b = error_ratio;
+      if (marker.id < result.error_history.size()) {
+        double error = result.error_history[marker.id];
+        double error_ratio = (error - min_error) / (max_error - min_error + 1e-5);
+        marker.color.a = 1.0;
+        marker.color.r = 1.0 - error_ratio;
+        marker.color.g = 0.0;
+        marker.color.b = error_ratio;
+      } else {
+        marker.color.a = 1.0;
+        marker.color.r = 0.5;
+        marker.color.g = 0.5;
+        marker.color.b = 0.5;
+      }
       marker.lifetime = rclcpp::Duration::from_seconds(0.1);
       marker_array.markers.push_back(marker);
       line_marker.points.push_back(marker.pose.position);
     }
+    }  // Close the else block from empty history check
     line_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
     marker_array.markers.push_back(line_marker);
 
@@ -256,7 +302,14 @@ private:
     marker_array.markers.push_back(pose_marker);
     marker_pub_->publish(marker_array);
 
-    RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %d, iterations: %d, error: %f", result.num_inliers, result.iterations, result.error);
+    RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %zu, iterations: %zu, error: %f", result.num_inliers, result.iterations, result.error);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Small GICP alignment failed with exception: %s", e.what());
+      return;
+    } catch (...) {
+      RCLCPP_ERROR(this->get_logger(), "Small GICP alignment failed with unknown exception");
+      return;
+    }
   }
 
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_publisher_;
@@ -271,9 +324,17 @@ private:
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 
-  RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ>::Ptr small_gicp;
-  // initialize target_cloud_ to avoid dereferencing a null pointer later
-  pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud_{new pcl::PointCloud<pcl::PointXYZ>()};
+  Registration<GICPFactor, ParallelReductionOMP> small_gicp;
+  PointCloud::Ptr target_points;
+  GaussianVoxelMap::Ptr target_voxelmap;
+
+  double voxel_resolution;
+  int num_threads;
+  int max_iterations;
+  double transformation_epsilon;
+  int num_neighbors;
+  double downsampling_resolution;
+  double max_correspondence_distance;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   bool initial_pose_received_ = false;
