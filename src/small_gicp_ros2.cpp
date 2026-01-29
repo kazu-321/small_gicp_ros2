@@ -75,14 +75,10 @@ public:
         for (const auto& point : pcl_cloud.points) {
           target_points->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
         }
-        auto target_tree = std::make_shared<KdTree<PointCloud>>(target_points, KdTreeBuilderOMP(num_threads));
-        estimate_covariances_omp(*target_points, *target_tree, num_neighbors, num_threads);
-        
-        // Build voxel map for VGICP
-        target_voxelmap = std::make_shared<GaussianVoxelMap>(voxel_resolution);
-        target_voxelmap->insert(*target_points);
+        target_tree_ptr = std::make_shared<KdTree<PointCloud>>(target_points, KdTreeBuilderOMP(num_threads));
+        estimate_covariances_omp(*target_points, *target_tree_ptr, num_neighbors, num_threads);
 
-        RCLCPP_INFO(this->get_logger(), "Loaded target pointcloud with %zu points into voxelmap", target_points->points.size());
+        RCLCPP_INFO(this->get_logger(), "Loaded target pointcloud with %zu points", target_points->points.size());
       });
 
     pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -140,15 +136,15 @@ private:
 
     Eigen::Isometry3d initial_pose_isometry = Eigen::Isometry3d(initial_pose_.cast<double>());
 
-    if (!target_points || !target_voxelmap) {
-      RCLCPP_WARN(this->get_logger(), "Target voxelmap not yet received");
+    if (!target_points || !target_tree_ptr) {
+      RCLCPP_WARN(this->get_logger(), "Target pointcloud not yet received");
       return;
     }
 
-    RCLCPP_INFO(this->get_logger(), "Aligning pointclouds with VGICP...");
+    RCLCPP_INFO(this->get_logger(), "Aligning pointclouds...");
     try {
-      // Perform VGICP alignment: point cloud to voxel map
-      auto result = small_gicp.align(*target_voxelmap, *source_points, *target_voxelmap, initial_pose_isometry);
+      // Perform GICP alignment
+      auto result = small_gicp.align(*target_points, *source_points, *target_tree_ptr, initial_pose_isometry);
       RCLCPP_INFO(this->get_logger(), "Alignment complete.");
       
       // Validate result
@@ -326,7 +322,7 @@ private:
 
   Registration<GICPFactor, ParallelReductionOMP> small_gicp;
   PointCloud::Ptr target_points;
-  GaussianVoxelMap::Ptr target_voxelmap;
+  KdTree<PointCloud>::Ptr target_tree_ptr;
 
   double voxel_resolution;
   int num_threads;
