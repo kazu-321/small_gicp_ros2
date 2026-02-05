@@ -68,7 +68,11 @@ private:
     initial_pose(0, 3) = pose_msg->pose.pose.position.x;
     initial_pose(1, 3) = pose_msg->pose.pose.position.y;
     initial_pose(2, 3) = pose_msg->pose.pose.position.z;
-    Eigen::Quaternionf initial_orientation(pose_msg->pose.pose.orientation.w, pose_msg->pose.pose.orientation.x, pose_msg->pose.pose.orientation.y, pose_msg->pose.pose.orientation.z);
+    Eigen::Quaternionf initial_orientation(
+      pose_msg->pose.pose.orientation.w,
+      pose_msg->pose.pose.orientation.x,
+      pose_msg->pose.pose.orientation.y,
+      pose_msg->pose.pose.orientation.z);
     initial_pose.block<3, 3>(0, 0) = initial_orientation.toRotationMatrix();
   }
 
@@ -116,6 +120,154 @@ private:
     }
 
     RCLCPP_INFO(this->get_logger(), "MAP: Map processing finished. points=%zu", target_pointcloud_new->points.size());
+  }
+
+  geometry_msgs::msg::PoseWithCovarianceStamped publish_pose(const Eigen::Isometry3d& transform_result) {
+    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
+    pose_msg.header.stamp = this->now();
+    pose_msg.header.frame_id = "map";
+    pose_msg.pose.pose.position.x = transform_result.translation().x();
+    pose_msg.pose.pose.position.y = transform_result.translation().y();
+    pose_msg.pose.pose.position.z = transform_result.translation().z();
+    Eigen::Quaterniond output_orientation(transform_result.rotation());
+    pose_msg.pose.pose.orientation.x = output_orientation.x();
+    pose_msg.pose.pose.orientation.y = output_orientation.y();
+    pose_msg.pose.pose.orientation.z = output_orientation.z();
+    pose_msg.pose.pose.orientation.w = output_orientation.w();
+
+    pose_msg.pose.covariance[0] = 0.0225;
+    pose_msg.pose.covariance[7] = 0.0225;
+    pose_msg.pose.covariance[14] = 0.0225;
+    pose_msg.pose.covariance[21] = 0.000625;
+    pose_msg.pose.covariance[28] = 0.000625;
+    pose_msg.pose.covariance[35] = 0.000625;
+    pose_publisher->publish(pose_msg);
+    return pose_msg;
+  }
+
+  void publish_transform(const geometry_msgs::msg::PoseWithCovarianceStamped& pose_msg) {
+    geometry_msgs::msg::TransformStamped transform_msg;
+    transform_msg.header.stamp = this->now();
+    transform_msg.header.frame_id = "map";
+    transform_msg.child_frame_id = "small_gicp";
+    transform_msg.transform.translation.x = pose_msg.pose.pose.position.x;
+    transform_msg.transform.translation.y = pose_msg.pose.pose.position.y;
+    transform_msg.transform.translation.z = pose_msg.pose.pose.position.z;
+    transform_msg.transform.rotation = pose_msg.pose.pose.orientation;
+    tf_broadcaster->sendTransform(transform_msg);
+  }
+
+  void publish_debug_data(const RegistrationResult& alignment_result) {
+    autoware_internal_debug_msgs::msg::Int32Stamped inlier_count_msg;
+    inlier_count_msg.stamp = this->now();
+    inlier_count_msg.data = alignment_result.num_inliers;
+    inlier_publisher->publish(inlier_count_msg);
+
+    autoware_internal_debug_msgs::msg::Int32Stamped iteration_count_msg;
+    iteration_count_msg.stamp = this->now();
+    iteration_count_msg.data = alignment_result.iterations;
+    iteration_publisher->publish(iteration_count_msg);
+
+    autoware_internal_debug_msgs::msg::Float32Stamped error_value_msg;
+    error_value_msg.stamp = this->now();
+    error_value_msg.data = alignment_result.error;
+    error_publisher->publish(error_value_msg);
+
+    if (!alignment_result.converged) {
+      RCLCPP_WARN(this->get_logger(), "Small GICP did not converge");
+    }
+  }
+
+  void publish_marker_array(const geometry_msgs::msg::PoseWithCovarianceStamped& pose_msg, const RegistrationResult& alignment_result) {
+    visualization_msgs::msg::MarkerArray marker_array;
+    visualization_msgs::msg::Marker line_marker;
+    line_marker.header.frame_id = "map";
+    line_marker.header.stamp = this->now();
+    line_marker.ns = "small_gicp_trajectory_line";
+    line_marker.id = 0;
+    line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    line_marker.action = visualization_msgs::msg::Marker::ADD;
+    line_marker.scale.x = 0.01;
+    line_marker.color.a = 0.8;
+    line_marker.color.r = 0.0;
+    line_marker.color.g = 1.0;
+    line_marker.color.b = 0.0;
+
+    double max_error = 0;
+    double min_error = 1e9;
+
+    // Check if history vectors are populated
+    if (alignment_result.error_history.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Error history is empty, skipping trajectory visualization");
+    } else {
+      for (const auto& error_value : alignment_result.error_history) {
+        if (error_value > max_error) max_error = error_value;
+        if (error_value < min_error) min_error = error_value;
+      }
+
+      for (const auto& transform : alignment_result.T_target_source_history) {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "map";
+        marker.header.stamp = this->now();
+        marker.ns = "small_gicp_trajectory";
+        marker.id = marker_array.markers.size();
+        marker.type = visualization_msgs::msg::Marker::ARROW;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        Eigen::Matrix4d transform_matrix = transform.matrix();
+        marker.pose.position.x = transform_matrix(0, 3);
+        marker.pose.position.y = transform_matrix(1, 3);
+        marker.pose.position.z = transform_matrix(2, 3);
+        Eigen::Quaterniond marker_orientation(transform_matrix.block<3, 3>(0, 0));
+        marker.pose.orientation.x = marker_orientation.x();
+        marker.pose.orientation.y = marker_orientation.y();
+        marker.pose.orientation.z = marker_orientation.z();
+        marker.pose.orientation.w = marker_orientation.w();
+        marker.scale.x = 0.02;
+        marker.scale.y = 0.01;
+        marker.scale.z = 0.01;
+
+        if (marker.id < alignment_result.error_history.size()) {
+          double error_value = alignment_result.error_history[marker.id];
+          double error_ratio = (error_value - min_error) / (max_error - min_error + 1e-5);
+          marker.color.a = 1.0;
+          marker.color.r = 1.0 - error_ratio;
+          marker.color.g = 0.0;
+          marker.color.b = error_ratio;
+        } else {
+          marker.color.a = 1.0;
+          marker.color.r = 0.5;
+          marker.color.g = 0.5;
+          marker.color.b = 0.5;
+        }
+        marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+        marker_array.markers.push_back(marker);
+        line_marker.points.push_back(marker.pose.position);
+      }
+    }  // Close the else block from empty history check
+    line_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+    marker_array.markers.push_back(line_marker);
+
+    visualization_msgs::msg::Marker pose_marker;
+    pose_marker.header.frame_id = "map";
+    pose_marker.header.stamp = this->now();
+    pose_marker.ns = "small_gicp_final_pose";
+    pose_marker.id = marker_array.markers.size();
+    pose_marker.type = visualization_msgs::msg::Marker::ARROW;
+    pose_marker.action = visualization_msgs::msg::Marker::ADD;
+    pose_marker.pose.position.x = pose_msg.pose.pose.position.x;
+    pose_marker.pose.position.y = pose_msg.pose.pose.position.y;
+    pose_marker.pose.position.z = pose_msg.pose.pose.position.z;
+    pose_marker.pose.orientation = pose_msg.pose.pose.orientation;
+    pose_marker.scale.x = 0.06;
+    pose_marker.scale.y = 0.03;
+    pose_marker.scale.z = 0.03;
+    pose_marker.color.a = 1.0;
+    pose_marker.color.r = 0.0;
+    pose_marker.color.g = 1.0;
+    pose_marker.color.b = 0.0;
+    pose_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+    marker_array.markers.push_back(pose_marker);
+    marker_publisher->publish(marker_array);
   }
 
   void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr pointcloud_msg) {
@@ -182,149 +334,15 @@ private:
       }
 
       const Eigen::Isometry3d& transform_result = alignment_result.T_target_source;
-
-      geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
-      pose_msg.header.stamp = this->now();
-      pose_msg.header.frame_id = "map";
-      pose_msg.pose.pose.position.x = transform_result.translation().x();
-      pose_msg.pose.pose.position.y = transform_result.translation().y();
-      pose_msg.pose.pose.position.z = transform_result.translation().z();
-      Eigen::Quaterniond output_orientation(transform_result.rotation());
-      pose_msg.pose.pose.orientation.x = output_orientation.x();
-      pose_msg.pose.pose.orientation.y = output_orientation.y();
-      pose_msg.pose.pose.orientation.z = output_orientation.z();
-      pose_msg.pose.pose.orientation.w = output_orientation.w();
-
-      pose_msg.pose.covariance[0] = 0.0225;
-      pose_msg.pose.covariance[7] = 0.0225;
-      pose_msg.pose.covariance[14] = 0.0225;
-      pose_msg.pose.covariance[21] = 0.000625;
-      pose_msg.pose.covariance[28] = 0.000625;
-      pose_msg.pose.covariance[35] = 0.000625;
-      pose_publisher->publish(pose_msg);
-
-      geometry_msgs::msg::TransformStamped transform_msg;
-      transform_msg.header.stamp = this->now();
-      transform_msg.header.frame_id = "map";
-      transform_msg.child_frame_id = "small_gicp";
-      transform_msg.transform.translation.x = pose_msg.pose.pose.position.x;
-      transform_msg.transform.translation.y = pose_msg.pose.pose.position.y;
-      transform_msg.transform.translation.z = pose_msg.pose.pose.position.z;
-      transform_msg.transform.rotation = pose_msg.pose.pose.orientation;
-      tf_broadcaster->sendTransform(transform_msg);
+      const auto pose_msg = publish_pose(transform_result);
+      publish_transform(pose_msg);
 
       pointcloud_msg->header.stamp = this->now();
       pointcloud_msg->header.frame_id = "small_gicp";
-      pointcloud_publisher->publish(*pointcloud_msg);
+      // pointcloud_publisher->publish(*pointcloud_msg); 重いからやらない
 
-      autoware_internal_debug_msgs::msg::Int32Stamped inlier_count_msg;
-      inlier_count_msg.stamp = this->now();
-      inlier_count_msg.data = alignment_result.num_inliers;
-      inlier_publisher->publish(inlier_count_msg);
-
-      autoware_internal_debug_msgs::msg::Int32Stamped iteration_count_msg;
-      iteration_count_msg.stamp = this->now();
-      iteration_count_msg.data = alignment_result.iterations;
-      iteration_publisher->publish(iteration_count_msg);
-
-      autoware_internal_debug_msgs::msg::Float32Stamped error_value_msg;
-      error_value_msg.stamp = this->now();
-      error_value_msg.data = alignment_result.error;
-      error_publisher->publish(error_value_msg);
-
-      if (!alignment_result.converged) {
-        RCLCPP_WARN(this->get_logger(), "Small GICP did not converge");
-      }
-
-      visualization_msgs::msg::MarkerArray marker_array;
-      visualization_msgs::msg::Marker line_marker;
-      line_marker.header.frame_id = "map";
-      line_marker.header.stamp = this->now();
-      line_marker.ns = "small_gicp_trajectory_line";
-      line_marker.id = 0;
-      line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-      line_marker.action = visualization_msgs::msg::Marker::ADD;
-      line_marker.scale.x = 0.01;
-      line_marker.color.a = 0.8;
-      line_marker.color.r = 0.0;
-      line_marker.color.g = 1.0;
-      line_marker.color.b = 0.0;
-
-      double max_error = 0;
-      double min_error = 1e9;
-
-      // Check if history vectors are populated
-      if (alignment_result.error_history.empty()) {
-        RCLCPP_WARN(this->get_logger(), "Error history is empty, skipping trajectory visualization");
-      } else {
-        for (const auto& error_value : alignment_result.error_history) {
-          if (error_value > max_error) max_error = error_value;
-          if (error_value < min_error) min_error = error_value;
-        }
-
-        for (const auto& transform : alignment_result.T_target_source_history) {
-          visualization_msgs::msg::Marker marker;
-          marker.header.frame_id = "map";
-          marker.header.stamp = this->now();
-          marker.ns = "small_gicp_trajectory";
-          marker.id = marker_array.markers.size();
-          marker.type = visualization_msgs::msg::Marker::ARROW;
-          marker.action = visualization_msgs::msg::Marker::ADD;
-          Eigen::Matrix4d transform_matrix = transform.matrix();
-          marker.pose.position.x = transform_matrix(0, 3);
-          marker.pose.position.y = transform_matrix(1, 3);
-          marker.pose.position.z = transform_matrix(2, 3);
-          Eigen::Quaterniond marker_orientation(transform_matrix.block<3, 3>(0, 0));
-          marker.pose.orientation.x = marker_orientation.x();
-          marker.pose.orientation.y = marker_orientation.y();
-          marker.pose.orientation.z = marker_orientation.z();
-          marker.pose.orientation.w = marker_orientation.w();
-          marker.scale.x = 0.02;
-          marker.scale.y = 0.01;
-          marker.scale.z = 0.01;
-
-          if (marker.id < alignment_result.error_history.size()) {
-            double error_value = alignment_result.error_history[marker.id];
-            double error_ratio = (error_value - min_error) / (max_error - min_error + 1e-5);
-            marker.color.a = 1.0;
-            marker.color.r = 1.0 - error_ratio;
-            marker.color.g = 0.0;
-            marker.color.b = error_ratio;
-          } else {
-            marker.color.a = 1.0;
-            marker.color.r = 0.5;
-            marker.color.g = 0.5;
-            marker.color.b = 0.5;
-          }
-          marker.lifetime = rclcpp::Duration::from_seconds(0.1);
-          marker_array.markers.push_back(marker);
-          line_marker.points.push_back(marker.pose.position);
-        }
-      }  // Close the else block from empty history check
-      line_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
-      marker_array.markers.push_back(line_marker);
-
-      visualization_msgs::msg::Marker pose_marker;
-      pose_marker.header.frame_id = "map";
-      pose_marker.header.stamp = this->now();
-      pose_marker.ns = "small_gicp_final_pose";
-      pose_marker.id = marker_array.markers.size();
-      pose_marker.type = visualization_msgs::msg::Marker::ARROW;
-      pose_marker.action = visualization_msgs::msg::Marker::ADD;
-      pose_marker.pose.position.x = pose_msg.pose.pose.position.x;
-      pose_marker.pose.position.y = pose_msg.pose.pose.position.y;
-      pose_marker.pose.position.z = pose_msg.pose.pose.position.z;
-      pose_marker.pose.orientation = pose_msg.pose.pose.orientation;
-      pose_marker.scale.x = 0.06;
-      pose_marker.scale.y = 0.03;
-      pose_marker.scale.z = 0.03;
-      pose_marker.color.a = 1.0;
-      pose_marker.color.r = 0.0;
-      pose_marker.color.g = 1.0;
-      pose_marker.color.b = 0.0;
-      pose_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
-      marker_array.markers.push_back(pose_marker);
-      marker_publisher->publish(marker_array);
+      publish_debug_data(alignment_result);
+      publish_marker_array(pose_msg, alignment_result);
 
       // RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %zu, iterations: %zu, error: %f", result.num_inliers, result.iterations, result.error);
     } catch (const std::exception& e) {
