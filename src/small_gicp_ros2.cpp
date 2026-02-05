@@ -24,147 +24,147 @@ class SmallGICPNode : public rclcpp::Node {
 public:
   SmallGICPNode() : Node("small_gicp_node") {
     voxel_resolution = this->declare_parameter("voxel_resolution", 1.0);
-    num_threads = this->declare_parameter("num_threads", 4);
-    max_iterations = this->declare_parameter("max_iterations", 50);
+    thread_count = this->declare_parameter("num_threads", 4);
+    max_iteration_count = this->declare_parameter("max_iterations", 50);
     transformation_epsilon = this->declare_parameter("transformation_epsilon", 0.0001);
-    num_neighbors = this->declare_parameter("num_neighbors", 20);
+    neighbor_count = this->declare_parameter("num_neighbors", 20);
     downsampling_resolution = this->declare_parameter("downsampling_resolution", 0.25);
     max_correspondence_distance = this->declare_parameter("max_correspondence_distance", 1.0);
 
     // Initialize GICP parameters
-    small_gicp.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
-    small_gicp.reduction.num_threads = num_threads;
-    small_gicp.optimizer.max_iterations = max_iterations;
-    small_gicp.criteria.translation_eps = transformation_epsilon;
+    gicp_registration.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
+    gicp_registration.reduction.num_threads = thread_count;
+    gicp_registration.optimizer.max_iterations = max_iteration_count;
+    gicp_registration.criteria.translation_eps = transformation_epsilon;
 
     // Publishers
-    pose_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("small_gicp/pose", 10);
-    pointcloud_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("small_gicp/pointcloud", 10);
-    inlier_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/inlier_count", 10);
-    iter_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/iteration_count", 10);
-    error_pub_ = this->create_publisher<autoware_internal_debug_msgs::msg::Float32Stamped>("small_gicp/error", 10);
-    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
-    marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("small_gicp/markers", 10);
+    pose_publisher = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("small_gicp/pose", 10);
+    pointcloud_publisher = this->create_publisher<sensor_msgs::msg::PointCloud2>("small_gicp/pointcloud", 10);
+    inlier_publisher = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/inlier_count", 10);
+    iteration_publisher = this->create_publisher<autoware_internal_debug_msgs::msg::Int32Stamped>("small_gicp/iteration_count", 10);
+    error_publisher = this->create_publisher<autoware_internal_debug_msgs::msg::Float32Stamped>("small_gicp/error", 10);
+    tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    marker_publisher = this->create_publisher<visualization_msgs::msg::MarkerArray>("small_gicp/markers", 10);
 
-    source_pointcloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    source_pointcloud_subscriber = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/localization/util/downsample/pointcloud",
       rclcpp::SensorDataQoS(),
       std::bind(&SmallGICPNode::pointcloud_callback, this, std::placeholders::_1));
-    target_pointcloud_subscriber_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    target_pointcloud_subscriber = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/localization/pose_estimator/debug/loaded_pointcloud_map_raw",
       1,
       std::bind(&SmallGICPNode::map_callback, this, std::placeholders::_1));
 
-    pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    pose_subscriber = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/localization/pose_with_covariance",
       rclcpp::SensorDataQoS(),
       std::bind(&SmallGICPNode::pose_callback, this, std::placeholders::_1));
   }
 
 private:
-  void pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
-    initial_pose_received_ = true;
-    initial_pose_ = Eigen::Matrix4f::Identity();
-    initial_pose_(0, 3) = msg->pose.pose.position.x;
-    initial_pose_(1, 3) = msg->pose.pose.position.y;
-    initial_pose_(2, 3) = msg->pose.pose.position.z;
-    Eigen::Quaternionf q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
-    initial_pose_.block<3, 3>(0, 0) = q.toRotationMatrix();
+  void pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr pose_msg) {
+    initial_pose_received = true;
+    initial_pose = Eigen::Matrix4f::Identity();
+    initial_pose(0, 3) = pose_msg->pose.pose.position.x;
+    initial_pose(1, 3) = pose_msg->pose.pose.position.y;
+    initial_pose(2, 3) = pose_msg->pose.pose.position.z;
+    Eigen::Quaternionf initial_orientation(pose_msg->pose.pose.orientation.w, pose_msg->pose.pose.orientation.x, pose_msg->pose.pose.orientation.y, pose_msg->pose.pose.orientation.z);
+    initial_pose.block<3, 3>(0, 0) = initial_orientation.toRotationMatrix();
   }
 
-  void map_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    if (map_processing_) {
+  void map_callback(const sensor_msgs::msg::PointCloud2::SharedPtr pointcloud_msg) {
+    if (map_processing) {
       RCLCPP_WARN(this->get_logger(), "Map: processing already running, skipping...");
       return;
     }
 
-    map_processing_ = true;
+    map_processing = true;
 
     // thread join safety
-    if (map_thread_.joinable()) {
-      map_thread_.join();
+    if (map_thread.joinable()) {
+      map_thread.join();
     }
 
-    auto msg_copy = *msg;  // deep copy
+    auto pointcloud_msg_copy = *pointcloud_msg;  // deep copy
 
-    map_thread_ = std::thread([this, msg_copy]() {
-      process_map(msg_copy);
-      map_processing_ = false;
+    map_thread = std::thread([this, pointcloud_msg_copy]() {
+      process_map(pointcloud_msg_copy);
+      map_processing = false;
     });
   }
 
-  void process_map(sensor_msgs::msg::PointCloud2 msg) {
+  void process_map(sensor_msgs::msg::PointCloud2 pointcloud_msg) {
     RCLCPP_INFO(this->get_logger(), "MAP: Start map processing in thread");
 
-    auto new_target_points = std::make_shared<PointCloud>();
+    auto target_pointcloud_new = std::make_shared<PointCloud>();
 
-    pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
-    pcl::fromROSMsg(msg, pcl_cloud);
+    pcl::PointCloud<pcl::PointXYZ> pcl_pointcloud;
+    pcl::fromROSMsg(pointcloud_msg, pcl_pointcloud);
 
-    for (const auto& point : pcl_cloud.points) {
-      new_target_points->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+    for (const auto& point : pcl_pointcloud.points) {
+      target_pointcloud_new->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
     }
 
-    auto new_tree = std::make_shared<KdTree<PointCloud>>(new_target_points, KdTreeBuilderOMP(num_threads));
+    auto target_tree_new = std::make_shared<KdTree<PointCloud>>(target_pointcloud_new, KdTreeBuilderOMP(thread_count));
 
-    estimate_covariances_omp(*new_target_points, *new_tree, num_neighbors, num_threads);
+    estimate_covariances_omp(*target_pointcloud_new, *target_tree_new, neighbor_count, thread_count);
 
     {
-      std::lock_guard<std::mutex> lock(map_mutex_);
-      target_points = new_target_points;
-      target_tree_ptr = new_tree;
+      std::lock_guard<std::mutex> lock(map_mutex);
+      target_pointcloud = target_pointcloud_new;
+      target_tree = target_tree_new;
     }
 
-    RCLCPP_INFO(this->get_logger(), "MAP: Map processing finished. points=%zu", new_target_points->points.size());
+    RCLCPP_INFO(this->get_logger(), "MAP: Map processing finished. points=%zu", target_pointcloud_new->points.size());
   }
 
-  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    if (!initial_pose_received_) {
+  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr pointcloud_msg) {
+    if (!initial_pose_received) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, "Waiting for initial pose...");
       return;
     }
 
-    Eigen::Quaternionf q(initial_pose_.block<3, 3>(0, 0));
-    if (!std::isfinite(q.w()) || !std::isfinite(q.x())) {
+    Eigen::Quaternionf initial_orientation(initial_pose.block<3, 3>(0, 0));
+    if (!std::isfinite(initial_orientation.w()) || !std::isfinite(initial_orientation.x())) {
       RCLCPP_WARN(this->get_logger(), "Invalid quaternion");
       return;
     }
 
     // RCLCPP_INFO(this->get_logger(), "Starting Small GICP alignment...");
 
-    PointCloud::Ptr source_points(new PointCloud());
-    pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
-    pcl::fromROSMsg(*msg, pcl_cloud);
-    for (const auto& point : pcl_cloud.points) {
-      source_points->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+    PointCloud::Ptr source_pointcloud(new PointCloud());
+    pcl::PointCloud<pcl::PointXYZ> pcl_pointcloud;
+    pcl::fromROSMsg(*pointcloud_msg, pcl_pointcloud);
+    for (const auto& point : pcl_pointcloud.points) {
+      source_pointcloud->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
     }
 
     // Validate source pointcloud
-    if (source_points->points.empty()) {
+    if (source_pointcloud->points.empty()) {
       RCLCPP_WARN(this->get_logger(), "Source pointcloud is empty");
       return;
     }
 
-    auto tree = std::make_shared<KdTree<PointCloud>>(source_points, KdTreeBuilderOMP(num_threads));
-    if (!tree) {
+    auto source_tree = std::make_shared<KdTree<PointCloud>>(source_pointcloud, KdTreeBuilderOMP(thread_count));
+    if (!source_tree) {
       RCLCPP_ERROR(this->get_logger(), "Failed to create KdTree for source points");
       return;
     }
-    estimate_covariances_omp(*source_points, *tree, num_neighbors, num_threads);
+    estimate_covariances_omp(*source_pointcloud, *source_tree, neighbor_count, thread_count);
 
     // RCLCPP_INFO(this->get_logger(), "Source pointcloud has %zu points", source_points->points.size());
 
-    Eigen::Isometry3d initial_pose_isometry = Eigen::Isometry3d(initial_pose_.cast<double>());
-    std::shared_ptr<PointCloud> local_target;
-    std::shared_ptr<KdTree<PointCloud>> local_tree;
+    Eigen::Isometry3d initial_pose_transform = Eigen::Isometry3d(initial_pose.cast<double>());
+    std::shared_ptr<PointCloud> target_pointcloud_local;
+    std::shared_ptr<KdTree<PointCloud>> target_tree_local;
 
     {
-      std::lock_guard<std::mutex> lock(map_mutex_);
-      local_target = target_points;
-      local_tree = target_tree_ptr;
+      std::lock_guard<std::mutex> lock(map_mutex);
+      target_pointcloud_local = target_pointcloud;
+      target_tree_local = target_tree;
     }
 
-    if (!local_target || !local_tree) {
+    if (!target_pointcloud_local || !target_tree_local) {
       RCLCPP_WARN(this->get_logger(), "Target pointcloud not ready");
       return;
     }
@@ -172,28 +172,28 @@ private:
     // RCLCPP_INFO(this->get_logger(), "Aligning pointclouds...");
     try {
       // Perform GICP alignment
-      auto result = small_gicp.align(*local_target, *source_points, *local_tree, initial_pose_isometry);
+      auto alignment_result = gicp_registration.align(*target_pointcloud_local, *source_pointcloud, *target_tree_local, initial_pose_transform);
       // RCLCPP_INFO(this->get_logger(), "Alignment complete.");
 
       // Validate result
-      if (!std::isfinite(result.error) || result.num_inliers == 0) {
-        RCLCPP_WARN(this->get_logger(), "Alignment produced invalid result - error: %f, inliers: %zu", result.error, result.num_inliers);
+      if (!std::isfinite(alignment_result.error) || alignment_result.num_inliers == 0) {
+        RCLCPP_WARN(this->get_logger(), "Alignment produced invalid result - error: %f, inliers: %zu", alignment_result.error, alignment_result.num_inliers);
         return;
       }
 
-      const Eigen::Isometry3d& T_result = result.T_target_source;
+      const Eigen::Isometry3d& transform_result = alignment_result.T_target_source;
 
       geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
       pose_msg.header.stamp = this->now();
       pose_msg.header.frame_id = "map";
-      pose_msg.pose.pose.position.x = T_result.translation().x();
-      pose_msg.pose.pose.position.y = T_result.translation().y();
-      pose_msg.pose.pose.position.z = T_result.translation().z();
-      Eigen::Quaterniond q_out(T_result.rotation());
-      pose_msg.pose.pose.orientation.x = q_out.x();
-      pose_msg.pose.pose.orientation.y = q_out.y();
-      pose_msg.pose.pose.orientation.z = q_out.z();
-      pose_msg.pose.pose.orientation.w = q_out.w();
+      pose_msg.pose.pose.position.x = transform_result.translation().x();
+      pose_msg.pose.pose.position.y = transform_result.translation().y();
+      pose_msg.pose.pose.position.z = transform_result.translation().z();
+      Eigen::Quaterniond output_orientation(transform_result.rotation());
+      pose_msg.pose.pose.orientation.x = output_orientation.x();
+      pose_msg.pose.pose.orientation.y = output_orientation.y();
+      pose_msg.pose.pose.orientation.z = output_orientation.z();
+      pose_msg.pose.pose.orientation.w = output_orientation.w();
 
       pose_msg.pose.covariance[0] = 0.0225;
       pose_msg.pose.covariance[7] = 0.0225;
@@ -201,7 +201,7 @@ private:
       pose_msg.pose.covariance[21] = 0.000625;
       pose_msg.pose.covariance[28] = 0.000625;
       pose_msg.pose.covariance[35] = 0.000625;
-      pose_publisher_->publish(pose_msg);
+      pose_publisher->publish(pose_msg);
 
       geometry_msgs::msg::TransformStamped transform_msg;
       transform_msg.header.stamp = this->now();
@@ -211,28 +211,28 @@ private:
       transform_msg.transform.translation.y = pose_msg.pose.pose.position.y;
       transform_msg.transform.translation.z = pose_msg.pose.pose.position.z;
       transform_msg.transform.rotation = pose_msg.pose.pose.orientation;
-      tf_broadcaster_->sendTransform(transform_msg);
+      tf_broadcaster->sendTransform(transform_msg);
 
-      msg->header.stamp = this->now();
-      msg->header.frame_id = "small_gicp";
-      pointcloud_publisher_->publish(*msg);
+      pointcloud_msg->header.stamp = this->now();
+      pointcloud_msg->header.frame_id = "small_gicp";
+      pointcloud_publisher->publish(*pointcloud_msg);
 
-      autoware_internal_debug_msgs::msg::Int32Stamped inlier_msg;
-      inlier_msg.stamp = this->now();
-      inlier_msg.data = result.num_inliers;
-      inlier_pub_->publish(inlier_msg);
+      autoware_internal_debug_msgs::msg::Int32Stamped inlier_count_msg;
+      inlier_count_msg.stamp = this->now();
+      inlier_count_msg.data = alignment_result.num_inliers;
+      inlier_publisher->publish(inlier_count_msg);
 
-      autoware_internal_debug_msgs::msg::Int32Stamped iter_msg;
-      iter_msg.stamp = this->now();
-      iter_msg.data = result.iterations;
-      iter_pub_->publish(iter_msg);
+      autoware_internal_debug_msgs::msg::Int32Stamped iteration_count_msg;
+      iteration_count_msg.stamp = this->now();
+      iteration_count_msg.data = alignment_result.iterations;
+      iteration_publisher->publish(iteration_count_msg);
 
-      autoware_internal_debug_msgs::msg::Float32Stamped error_msg;
-      error_msg.stamp = this->now();
-      error_msg.data = result.error;
-      error_pub_->publish(error_msg);
+      autoware_internal_debug_msgs::msg::Float32Stamped error_value_msg;
+      error_value_msg.stamp = this->now();
+      error_value_msg.data = alignment_result.error;
+      error_publisher->publish(error_value_msg);
 
-      if (!result.converged) {
+      if (!alignment_result.converged) {
         RCLCPP_WARN(this->get_logger(), "Small GICP did not converge");
       }
 
@@ -254,15 +254,15 @@ private:
       double min_error = 1e9;
 
       // Check if history vectors are populated
-      if (result.error_history.empty()) {
+      if (alignment_result.error_history.empty()) {
         RCLCPP_WARN(this->get_logger(), "Error history is empty, skipping trajectory visualization");
       } else {
-        for (const auto& error : result.error_history) {
-          if (error > max_error) max_error = error;
-          if (error < min_error) min_error = error;
+        for (const auto& error_value : alignment_result.error_history) {
+          if (error_value > max_error) max_error = error_value;
+          if (error_value < min_error) min_error = error_value;
         }
 
-        for (const auto& T : result.T_target_source_history) {
+        for (const auto& transform : alignment_result.T_target_source_history) {
           visualization_msgs::msg::Marker marker;
           marker.header.frame_id = "map";
           marker.header.stamp = this->now();
@@ -270,22 +270,22 @@ private:
           marker.id = marker_array.markers.size();
           marker.type = visualization_msgs::msg::Marker::ARROW;
           marker.action = visualization_msgs::msg::Marker::ADD;
-          Eigen::Matrix4d mat = T.matrix();
-          marker.pose.position.x = mat(0, 3);
-          marker.pose.position.y = mat(1, 3);
-          marker.pose.position.z = mat(2, 3);
-          Eigen::Quaterniond q_marker(mat.block<3, 3>(0, 0));
-          marker.pose.orientation.x = q_marker.x();
-          marker.pose.orientation.y = q_marker.y();
-          marker.pose.orientation.z = q_marker.z();
-          marker.pose.orientation.w = q_marker.w();
+          Eigen::Matrix4d transform_matrix = transform.matrix();
+          marker.pose.position.x = transform_matrix(0, 3);
+          marker.pose.position.y = transform_matrix(1, 3);
+          marker.pose.position.z = transform_matrix(2, 3);
+          Eigen::Quaterniond marker_orientation(transform_matrix.block<3, 3>(0, 0));
+          marker.pose.orientation.x = marker_orientation.x();
+          marker.pose.orientation.y = marker_orientation.y();
+          marker.pose.orientation.z = marker_orientation.z();
+          marker.pose.orientation.w = marker_orientation.w();
           marker.scale.x = 0.02;
           marker.scale.y = 0.01;
           marker.scale.z = 0.01;
 
-          if (marker.id < result.error_history.size()) {
-            double error = result.error_history[marker.id];
-            double error_ratio = (error - min_error) / (max_error - min_error + 1e-5);
+          if (marker.id < alignment_result.error_history.size()) {
+            double error_value = alignment_result.error_history[marker.id];
+            double error_ratio = (error_value - min_error) / (max_error - min_error + 1e-5);
             marker.color.a = 1.0;
             marker.color.r = 1.0 - error_ratio;
             marker.color.g = 0.0;
@@ -324,7 +324,7 @@ private:
       pose_marker.color.b = 0.0;
       pose_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
       marker_array.markers.push_back(pose_marker);
-      marker_pub_->publish(marker_array);
+      marker_publisher->publish(marker_array);
 
       // RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %zu, iterations: %zu, error: %f", result.num_inliers, result.iterations, result.error);
     } catch (const std::exception& e) {
@@ -336,37 +336,37 @@ private:
     }
   }
 
-  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_publisher_;
-  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr inlier_pub_;
-  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr iter_pub_;
-  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr error_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_publisher;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_publisher;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr inlier_publisher;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr iteration_publisher;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr error_publisher;
 
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr source_pointcloud_subscriber_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr target_pointcloud_subscriber_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr source_pointcloud_subscriber;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr target_pointcloud_subscriber;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_subscriber;
 
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher;
 
-  Registration<GICPFactor, ParallelReductionOMP> small_gicp;
-  PointCloud::Ptr target_points;
-  KdTree<PointCloud>::Ptr target_tree_ptr;
+  Registration<GICPFactor, ParallelReductionOMP> gicp_registration;
+  PointCloud::Ptr target_pointcloud;
+  KdTree<PointCloud>::Ptr target_tree;
 
-  std::mutex map_mutex_;
-  std::atomic<bool> map_processing_{false};
-  std::thread map_thread_;
+  std::mutex map_mutex;
+  std::atomic<bool> map_processing{false};
+  std::thread map_thread;
 
   double voxel_resolution;
-  int num_threads;
-  int max_iterations;
+  int thread_count;
+  int max_iteration_count;
   double transformation_epsilon;
-  int num_neighbors;
+  int neighbor_count;
   double downsampling_resolution;
   double max_correspondence_distance;
 
-  std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-  bool initial_pose_received_ = false;
-  Eigen::Matrix4f initial_pose_;
+  std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
+  bool initial_pose_received = false;
+  Eigen::Matrix4f initial_pose;
 };
 
 int main(int argc, char** argv) {
