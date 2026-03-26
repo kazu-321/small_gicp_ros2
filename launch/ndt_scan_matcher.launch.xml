@@ -23,8 +23,21 @@
     <node pkg="small_gicp_ros2" exec="small_gicp_ros2" name="small_gicp_ros2" output="screen">
       <remap from="small_gicp/pose" to="/localization/pose_estimator/pose_with_covariance"/>
       <remap from="/localization/pose_with_covariance" to="/localization/pose_twist_fusion_filter/biased_pose_with_covariance"/>
-      <param name="pcd_file" value="/home/kazusahashimoto/ros2_ws/shinagawa_odaiba/output.pcd"/>
-      <param name="transformation_epsilon" value="0.0"/>
+      <!-- <remap from="/localization/util/downsample/pointcloud" to="/sensing/lidar/concatenated/pointcloud"/> -->
+      <remap from="/localization/util/downsample/pointcloud" to="/localization/util/measurement_range/pointcloud"/>
+      <param name="pcd_file" value="/home/kazusahashimoto/ros2_ws/rosbag/shinagawa_odaiba/output.pcd"/>
+      <param name="num_threads" value="4"/>
+      <param name="max_iterations" value="20"/>
+      <param name="transformation_epsilon" value="0.001"/>
+      <param name="rotation_epsilon" value="0.002"/>
+      <param name="num_neighbors" value="10"/>
+      <param name="downsampling_resolution" value="0.75"/> 
+      <param name="max_correspondence_distance" value="1.0"/> 
+      <param name="use_downsampling_source" value="true"/>
+      <param name="use_downsampling_target" value="true"/>
+      <param name="use_voxelmap" value="true"/>
+      <param name="voxel_resolution" value="2.0"/>
+      <param name="map_load_distance" value="1000.0"/>
     </node>
   </group>
 </launch>

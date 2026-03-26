@@ -1,18 +1,19 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include <chrono>
 #include <tf2_ros/transform_broadcaster.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 
 #include <small_gicp/ann/kdtree_omp.hpp>
 #include <small_gicp/ann/gaussian_voxelmap.hpp>
-#include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/factors/gicp_factor.hpp>
-#include <small_gicp/util/downsampling_omp.hpp>
-#include <small_gicp/util/normal_estimation_omp.hpp>
+#include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/registration/registration.hpp>
+#include <small_gicp/util/downsampling_omp.hpp>
+#include <small_gicp/util/normal_estimation_omp.hpp>
 
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
@@ -34,6 +35,10 @@ public:
 
     use_downsampling_source = this->declare_parameter("use_downsampling_source", true);
     use_downsampling_target = this->declare_parameter("use_downsampling_target", true);
+    voxel_resolution = this->declare_parameter("voxel_resolution", 0.5);
+    use_voxelmap = this->declare_parameter("use_voxelmap", true);
+
+    map_load_distance = this->declare_parameter("map_load_distance", 100.0);
 
     // Initialize GICP parameters
     gicp_registration.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
@@ -57,7 +62,7 @@ public:
       rclcpp::SensorDataQoS(),
       std::bind(&SmallGICPNode::pointcloud_callback, this, std::placeholders::_1));
     target_pointcloud_subscriber = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/localization/pose_estimator/debug/loaded_pointcloud_map_raw",
+      "/localization/pose_estimator/debug/loaded_pointcloud_map",
       1,
       std::bind(&SmallGICPNode::map_callback, this, std::placeholders::_1));
 
@@ -112,7 +117,13 @@ private:
     pcl::fromROSMsg(pointcloud_msg, pcl_pointcloud);
 
     for (const auto& point : pcl_pointcloud.points) {
-      target_pointcloud_new->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+      if (!initial_pose_received) {
+        target_pointcloud_new->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+      } else {
+        if (std::hypot(point.x - initial_pose(0, 3), point.y - initial_pose(1, 3)) < map_load_distance) {
+          target_pointcloud_new->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+        }
+      }
     }
 
     if (use_downsampling_target) {
@@ -126,14 +137,24 @@ private:
     }
     pcl::toROSMsg(downsampled_pcl_pointcloud, downsampled_pointcloud_msg);
 
-    auto target_tree_new = std::make_shared<KdTree<PointCloud>>(target_pointcloud_new, KdTreeBuilderOMP(thread_count));
+    std::shared_ptr<KdTree<PointCloud>> target_tree_new;
 
+    target_tree_new = std::make_shared<KdTree<PointCloud>>(target_pointcloud_new, KdTreeBuilderOMP(thread_count));
     estimate_covariances_omp(*target_pointcloud_new, *target_tree_new, neighbor_count, thread_count);
+
+    std::shared_ptr<GaussianVoxelMap> target_voxelmap_new;
+    if (use_voxelmap) {
+      target_voxelmap_new = std::make_shared<GaussianVoxelMap>(voxel_resolution);
+      target_voxelmap_new->insert(*target_pointcloud_new);
+    }
 
     {
       std::lock_guard<std::mutex> lock(map_mutex);
       target_pointcloud = target_pointcloud_new;
       target_tree = target_tree_new;
+      if (use_voxelmap) {
+        target_voxelmap = target_voxelmap_new;
+      }
     }
 
     RCLCPP_INFO(this->get_logger(), "MAP: Map processing finished. points=%zu", target_pointcloud_new->points.size());
@@ -291,6 +312,19 @@ private:
   }
 
   void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr pointcloud_msg) {
+    using Clock = std::chrono::steady_clock;
+    const auto to_ms = [](const Clock::time_point& start, const Clock::time_point& end) { return std::chrono::duration<double, std::milli>(end - start).count(); };
+
+    double time_transform_ms = 0.0;
+    double time_downsample_ms = 0.0;
+    double time_debugmsg_ms = 0.0;
+    double time_kdtree_ms = 0.0;
+    double time_covariance_ms = 0.0;
+    double time_voxelmap_ms = 0.0;
+    double time_align_ms = 0.0;
+    double time_publish_ms = 0.0;
+    double time_pointcloud_publish_ms = 0.0;
+
     if (!initial_pose_received) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, "Waiting for initial pose...");
       return;
@@ -302,14 +336,17 @@ private:
       return;
     }
 
-    // RCLCPP_INFO(this->get_logger(), "Starting Small GICP alignment...");
-
     PointCloud::Ptr source_pointcloud(new PointCloud());
     pcl::PointCloud<pcl::PointXYZ> pcl_pointcloud;
     pcl::fromROSMsg(*pointcloud_msg, pcl_pointcloud);
+
+    const auto transform_start = Clock::now();
     for (const auto& point : pcl_pointcloud.points) {
-      source_pointcloud->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+      if (std::hypot(point.x, point.y) < map_load_distance) {
+        source_pointcloud->points.push_back(Eigen::Vector4d(point.x, point.y, point.z, 1.0));
+      }
     }
+    time_transform_ms = to_ms(transform_start, Clock::now());
 
     // Validate source pointcloud
     if (source_pointcloud->points.empty()) {
@@ -318,45 +355,82 @@ private:
     }
 
     if (use_downsampling_source) {
+      const auto downsample_start = Clock::now();
       source_pointcloud = voxelgrid_sampling_omp(*source_pointcloud, downsampling_resolution, thread_count);
+      time_downsample_ms = to_ms(downsample_start, Clock::now());
     }
 
     sensor_msgs::msg::PointCloud2 downsampled_pointcloud_msg;
     pcl::PointCloud<pcl::PointXYZ> downsampled_pcl_pointcloud;
+    const auto debugmsg_start = Clock::now();
     for (const auto& point : source_pointcloud->points) {
       downsampled_pcl_pointcloud.points.push_back(pcl::PointXYZ(point.x(), point.y(), point.z()));
     }
     pcl::toROSMsg(downsampled_pcl_pointcloud, downsampled_pointcloud_msg);
+    time_debugmsg_ms = to_ms(debugmsg_start, Clock::now());
 
+    const auto kdtree_start = Clock::now();
     auto source_tree = std::make_shared<KdTree<PointCloud>>(source_pointcloud, KdTreeBuilderOMP(thread_count));
+    time_kdtree_ms = to_ms(kdtree_start, Clock::now());
     if (!source_tree) {
       RCLCPP_ERROR(this->get_logger(), "Failed to create KdTree for source points");
       return;
     }
-    estimate_covariances_omp(*source_pointcloud, *source_tree, neighbor_count, thread_count);
 
-    RCLCPP_INFO(this->get_logger(), "Source pointcloud has %zu points,", source_pointcloud->points.size());
+    const auto covariance_start = Clock::now();
+    estimate_covariances_omp(*source_pointcloud, *source_tree, neighbor_count, thread_count);
+    time_covariance_ms = to_ms(covariance_start, Clock::now());
+
+    if (use_voxelmap) {
+      const auto voxelmap_start = Clock::now();
+      auto source_voxelmap = std::make_shared<GaussianVoxelMap>(voxel_resolution);
+      source_voxelmap->insert(*source_pointcloud);
+      time_voxelmap_ms = to_ms(voxelmap_start, Clock::now());
+    }
+
+    // RCLCPP_INFO(this->get_logger(), "Source pointcloud has %zu points,", source_pointcloud->points.size());
 
     Eigen::Isometry3d initial_pose_transform = Eigen::Isometry3d(initial_pose.cast<double>());
     std::shared_ptr<PointCloud> target_pointcloud_local;
     std::shared_ptr<KdTree<PointCloud>> target_tree_local;
+    std::shared_ptr<GaussianVoxelMap> target_voxelmap_local;
 
     {
       std::lock_guard<std::mutex> lock(map_mutex);
       target_pointcloud_local = target_pointcloud;
-      target_tree_local = target_tree;
+      if (!use_voxelmap) {
+        target_tree_local = target_tree;
+      }
+      if (use_voxelmap) {
+        target_voxelmap_local = target_voxelmap;
+      }
     }
 
-    if (!target_pointcloud_local || !target_tree_local) {
+    if (!target_pointcloud_local) {
       RCLCPP_WARN(this->get_logger(), "Target pointcloud not ready");
       return;
     }
 
-    // RCLCPP_INFO(this->get_logger(), "Aligning pointclouds...");
+    if (!use_voxelmap && !target_tree_local) {
+      RCLCPP_WARN(this->get_logger(), "Target KdTree not ready");
+      return;
+    }
+
+    if (use_voxelmap && !target_voxelmap_local) {
+      RCLCPP_WARN(this->get_logger(), "Target voxelmap not ready");
+      return;
+    }
+
     try {
       // Perform GICP alignment
-      auto alignment_result = gicp_registration.align(*target_pointcloud_local, *source_pointcloud, *target_tree_local, initial_pose_transform);
-      // RCLCPP_INFO(this->get_logger(), "Alignment complete.");
+      RegistrationResult alignment_result;
+      const auto align_start = Clock::now();
+      if (use_voxelmap) {
+        alignment_result = gicp_registration.align(*target_voxelmap_local, *source_pointcloud, *target_voxelmap_local, initial_pose_transform);
+      } else {
+        alignment_result = gicp_registration.align(*target_pointcloud_local, *source_pointcloud, *target_tree_local, initial_pose_transform);
+      }
+      time_align_ms = to_ms(align_start, Clock::now());
 
       // Validate result
       if (!std::isfinite(alignment_result.error) || alignment_result.num_inliers == 0) {
@@ -365,14 +439,36 @@ private:
       }
 
       const Eigen::Isometry3d& transform_result = alignment_result.T_target_source;
+
+      const auto publish_start = Clock::now();
       const auto pose_msg = publish_pose(transform_result);
       publish_transform(pose_msg);
 
       publish_debug_data(alignment_result);
       publish_marker_array(pose_msg, alignment_result);
+      time_publish_ms = to_ms(publish_start, Clock::now());
+
+      const auto pointcloud_publish_start = Clock::now();
       downsampled_pointcloud_msg.header.stamp = this->now();
       downsampled_pointcloud_msg.header.frame_id = pointcloud_msg->header.frame_id;
       source_pointcloud_publisher->publish(downsampled_pointcloud_msg);
+      time_pointcloud_publish_ms = to_ms(pointcloud_publish_start, Clock::now());
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "pointcloud_callback timing[ms]: transform=%.3f downsample=%.3f debug_msg=%.3f kdtree=%.3f covariance=%.3f voxelmap=%.3f align=%.3f publish=%.3f pointcloud_publish=%.3f "
+        "num_points=%zu -> %zu",
+        time_transform_ms,
+        time_downsample_ms,
+        time_debugmsg_ms,
+        time_kdtree_ms,
+        time_covariance_ms,
+        time_voxelmap_ms,
+        time_align_ms,
+        time_publish_ms,
+        time_pointcloud_publish_ms,
+        pcl_pointcloud.points.size(),
+        source_pointcloud->points.size());
 
       // RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %zu, iterations: %zu, error: %f", result.num_inliers, result.iterations, result.error);
     } catch (const std::exception& e) {
@@ -400,6 +496,7 @@ private:
   Registration<GICPFactor, ParallelReductionOMP> gicp_registration;
   PointCloud::Ptr target_pointcloud;
   KdTree<PointCloud>::Ptr target_tree;
+  GaussianVoxelMap::Ptr target_voxelmap;
 
   std::mutex map_mutex;
   std::atomic<bool> map_processing{false};
@@ -412,9 +509,13 @@ private:
   int neighbor_count;
   double downsampling_resolution;
   double max_correspondence_distance;
+  double voxel_resolution;
+
+  double map_load_distance;
 
   bool use_downsampling_source = true;
   bool use_downsampling_target = true;
+  bool use_voxelmap = true;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
   bool initial_pose_received = false;
