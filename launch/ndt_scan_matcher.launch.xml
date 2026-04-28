@@ -27,17 +27,28 @@
       <remap from="/localization/util/downsample/pointcloud" to="/localization/util/measurement_range/pointcloud"/>
       <param name="pcd_file" value="/home/kazusahashimoto/ros2_ws/rosbag/shinagawa_odaiba/output.pcd"/>
       <param name="num_threads" value="4"/>
-      <param name="max_iterations" value="20"/>
+      <param name="max_iterations" value="30"/>
       <param name="transformation_epsilon" value="0.001"/>
       <param name="rotation_epsilon" value="0.002"/>
       <param name="num_neighbors" value="10"/>
-      <param name="downsampling_resolution" value="0.75"/> 
-      <param name="max_correspondence_distance" value="1.0"/> 
+      <param name="downsampling_resolution" value="1.0"/> 
+      <param name="max_correspondence_distance" value="0.3"/> 
       <param name="use_downsampling_source" value="true"/>
       <param name="use_downsampling_target" value="true"/>
       <param name="use_voxelmap" value="true"/>
-      <param name="voxel_resolution" value="2.0"/>
+      <param name="voxel_resolution" value="1.0"/>
       <param name="map_load_distance" value="1000.0"/>
     </node>
   </group>
 </launch>
+
+<!-- 
+カーブ時に広がる現象はカーブの影響ではない可能性？
+横にいるトラックに引っ張られているように見える
+ -> 極限までcorrespondence distanceを小さくしてみる  (0.3 で解決！)
+ -> 速い速度で移動すると範囲外で収束しなくなってしまう
+ -> 時間の線形補間つきで初期位置を与えればいい？
+
+ 初期位置引き算　比例　clamp
+ -->
+ 
