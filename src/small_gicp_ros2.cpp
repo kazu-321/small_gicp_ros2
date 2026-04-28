@@ -456,7 +456,7 @@ private:
 
       RCLCPP_INFO(
         this->get_logger(),
-        "pointcloud_callback timing[ms]: transform=%.3f downsample=%.3f debug_msg=%.3f kdtree=%.3f covariance=%.3f voxelmap=%.3f align=%.3f publish=%.3f pointcloud_publish=%.3f "
+        "pointcloud_callback timing[ms]: transform=%.3f downsample=%.3f debug_msg=%.3f kdtree=%.3f covariance=%.3f voxelmap=%.3f align=%.3f (%2d) publish=%.3f pointcloud_publish=%.3f "
         "num_points=%zu -> %zu",
         time_transform_ms,
         time_downsample_ms,
@@ -465,6 +465,7 @@ private:
         time_covariance_ms,
         time_voxelmap_ms,
         time_align_ms,
+        alignment_result.iterations,
         time_publish_ms,
         time_pointcloud_publish_ms,
         pcl_pointcloud.points.size(),
