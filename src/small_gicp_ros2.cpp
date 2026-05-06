@@ -19,6 +19,7 @@
 #include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include "visualization_msgs/msg/marker_array.hpp"
+#include <autoware/localization_util/smart_pose_buffer.hpp>
 
 using namespace small_gicp;
 
@@ -39,6 +40,12 @@ public:
     use_voxelmap = this->declare_parameter("use_voxelmap", true);
 
     map_load_distance = this->declare_parameter("map_load_distance", 100.0);
+
+    // Initialize SmartPoseBuffer parameters
+    use_interpolated_pose = this->declare_parameter("use_interpolated_pose", true);
+    double pose_timeout_sec = this->declare_parameter("pose_timeout_sec", 1.0);
+    double pose_distance_tolerance_meters = this->declare_parameter("pose_distance_tolerance_meters", 10.0);
+    pose_buffer = std::make_shared<autoware::localization_util::SmartPoseBuffer>(this->get_logger(), pose_timeout_sec, pose_distance_tolerance_meters);
 
     // Initialize GICP parameters
     gicp_registration.rejector.max_dist_sq = max_correspondence_distance * max_correspondence_distance;
@@ -74,17 +81,8 @@ public:
 
 private:
   void pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr pose_msg) {
-    initial_pose_received = true;
-    initial_pose = Eigen::Matrix4f::Identity();
-    initial_pose(0, 3) = pose_msg->pose.pose.position.x;
-    initial_pose(1, 3) = pose_msg->pose.pose.position.y;
-    initial_pose(2, 3) = pose_msg->pose.pose.position.z;
-    Eigen::Quaternionf initial_orientation(
-      pose_msg->pose.pose.orientation.w,
-      pose_msg->pose.pose.orientation.x,
-      pose_msg->pose.pose.orientation.y,
-      pose_msg->pose.pose.orientation.z);
-    initial_pose.block<3, 3>(0, 0) = initial_orientation.toRotationMatrix();
+    pose_buffer->push_back(pose_msg);
+    latest_pose_msg = pose_msg;
   }
 
   void map_callback(const sensor_msgs::msg::PointCloud2::SharedPtr pointcloud_msg) {
@@ -158,14 +156,13 @@ private:
     }
 
     RCLCPP_INFO(this->get_logger(), "MAP: Map processing finished. points=%zu", target_pointcloud_new->points.size());
-    downsampled_pointcloud_msg.header.stamp = this->now();
+    downsampled_pointcloud_msg.header.stamp = now();
     downsampled_pointcloud_msg.header.frame_id = "map";
     target_pointcloud_publisher->publish(downsampled_pointcloud_msg);
   }
 
   geometry_msgs::msg::PoseWithCovarianceStamped publish_pose(const Eigen::Isometry3d& transform_result) {
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
-    pose_msg.header.stamp = this->now();
     pose_msg.header.frame_id = "map";
     pose_msg.pose.pose.position.x = transform_result.translation().x();
     pose_msg.pose.pose.position.y = transform_result.translation().y();
@@ -182,13 +179,12 @@ private:
     pose_msg.pose.covariance[21] = 0.000625;
     pose_msg.pose.covariance[28] = 0.000625;
     pose_msg.pose.covariance[35] = 0.000625;
-    pose_publisher->publish(pose_msg);
     return pose_msg;
   }
 
   void publish_transform(const geometry_msgs::msg::PoseWithCovarianceStamped& pose_msg) {
     geometry_msgs::msg::TransformStamped transform_msg;
-    transform_msg.header.stamp = this->now();
+    transform_msg.header.stamp = pose_msg.header.stamp;
     transform_msg.header.frame_id = "map";
     transform_msg.child_frame_id = "small_gicp";
     transform_msg.transform.translation.x = pose_msg.pose.pose.position.x;
@@ -198,19 +194,19 @@ private:
     tf_broadcaster->sendTransform(transform_msg);
   }
 
-  void publish_debug_data(const RegistrationResult& alignment_result) {
+  void publish_debug_data(const RegistrationResult& alignment_result, const rclcpp::Time& timestamp) {
     autoware_internal_debug_msgs::msg::Int32Stamped inlier_count_msg;
-    inlier_count_msg.stamp = this->now();
+    inlier_count_msg.stamp = timestamp;
     inlier_count_msg.data = alignment_result.num_inliers;
     inlier_publisher->publish(inlier_count_msg);
 
     autoware_internal_debug_msgs::msg::Int32Stamped iteration_count_msg;
-    iteration_count_msg.stamp = this->now();
+    iteration_count_msg.stamp = timestamp;
     iteration_count_msg.data = alignment_result.iterations;
     iteration_publisher->publish(iteration_count_msg);
 
     autoware_internal_debug_msgs::msg::Float32Stamped error_value_msg;
-    error_value_msg.stamp = this->now();
+    error_value_msg.stamp = timestamp;
     error_value_msg.data = alignment_result.error;
     error_publisher->publish(error_value_msg);
 
@@ -223,7 +219,7 @@ private:
     visualization_msgs::msg::MarkerArray marker_array;
     visualization_msgs::msg::Marker line_marker;
     line_marker.header.frame_id = "map";
-    line_marker.header.stamp = this->now();
+    line_marker.header.stamp = pose_msg.header.stamp;
     line_marker.ns = "small_gicp_trajectory_line";
     line_marker.id = 0;
     line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
@@ -249,7 +245,7 @@ private:
       for (const auto& transform : alignment_result.T_target_source_history) {
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = "map";
-        marker.header.stamp = this->now();
+        marker.header.stamp = pose_msg.header.stamp;
         marker.ns = "small_gicp_trajectory";
         marker.id = marker_array.markers.size();
         marker.type = visualization_msgs::msg::Marker::ARROW;
@@ -290,7 +286,7 @@ private:
 
     visualization_msgs::msg::Marker pose_marker;
     pose_marker.header.frame_id = "map";
-    pose_marker.header.stamp = this->now();
+    pose_marker.header.stamp = pose_msg.header.stamp;
     pose_marker.ns = "small_gicp_final_pose";
     pose_marker.id = marker_array.markers.size();
     pose_marker.type = visualization_msgs::msg::Marker::ARROW;
@@ -315,6 +311,35 @@ private:
     using Clock = std::chrono::steady_clock;
     const auto to_ms = [](const Clock::time_point& start, const Clock::time_point& end) { return std::chrono::duration<double, std::milli>(end - start).count(); };
 
+    // Interpolate pose at pointcloud timestamp
+    const rclcpp::Time pointcloud_timestamp = rclcpp::Time(pointcloud_msg->header.stamp);
+    // start overall callback timer
+    const auto callback_start = Clock::now();
+    auto interpolate_result = pose_buffer->interpolate(pointcloud_timestamp);
+    if (!interpolate_result) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, "Failed to interpolate pose at pointcloud timestamp");
+      return;
+    }
+
+    // Convert interpolated pose to initial_pose
+    initial_pose_received = true;
+    initial_pose = Eigen::Matrix4f::Identity();
+    geometry_msgs::msg::PoseWithCovarianceStamped initial_pose_msg;
+    if (use_interpolated_pose) {
+      initial_pose_msg = interpolate_result->interpolated_pose;
+    } else {
+      initial_pose_msg = *latest_pose_msg;
+    }
+    initial_pose(0, 3) = initial_pose_msg.pose.pose.position.x;
+    initial_pose(1, 3) = initial_pose_msg.pose.pose.position.y;
+    initial_pose(2, 3) = initial_pose_msg.pose.pose.position.z;
+    Eigen::Quaternionf initial_orientation(
+      initial_pose_msg.pose.pose.orientation.w,
+      initial_pose_msg.pose.pose.orientation.x,
+      initial_pose_msg.pose.pose.orientation.y,
+      initial_pose_msg.pose.pose.orientation.z);
+    initial_pose.block<3, 3>(0, 0) = initial_orientation.toRotationMatrix();
+
     double time_transform_ms = 0.0;
     double time_downsample_ms = 0.0;
     double time_debugmsg_ms = 0.0;
@@ -330,8 +355,8 @@ private:
       return;
     }
 
-    Eigen::Quaternionf initial_orientation(initial_pose.block<3, 3>(0, 0));
-    if (!std::isfinite(initial_orientation.w()) || !std::isfinite(initial_orientation.x())) {
+    Eigen::Quaternionf initial_orientation_check(initial_pose.block<3, 3>(0, 0));
+    if (!std::isfinite(initial_orientation_check.w()) || !std::isfinite(initial_orientation_check.x())) {
       RCLCPP_WARN(this->get_logger(), "Invalid quaternion");
       return;
     }
@@ -441,23 +466,42 @@ private:
       const Eigen::Isometry3d& transform_result = alignment_result.T_target_source;
 
       const auto publish_start = Clock::now();
-      const auto pose_msg = publish_pose(transform_result);
+
+      // Publish using pointcloud timestamp (same as NDT)
+
+      rclcpp::Time stamp_to_use;
+      if (use_interpolated_pose) {
+        stamp_to_use = pointcloud_timestamp;
+      } else {
+        stamp_to_use = now();
+      }
+      auto pose_msg = publish_pose(transform_result);
+      pose_msg.header.stamp = stamp_to_use;
+      pose_publisher->publish(pose_msg);
+
       publish_transform(pose_msg);
 
-      publish_debug_data(alignment_result);
+      publish_debug_data(alignment_result, stamp_to_use);
       publish_marker_array(pose_msg, alignment_result);
       time_publish_ms = to_ms(publish_start, Clock::now());
 
       const auto pointcloud_publish_start = Clock::now();
-      downsampled_pointcloud_msg.header.stamp = this->now();
+      downsampled_pointcloud_msg.header.stamp = stamp_to_use;
       downsampled_pointcloud_msg.header.frame_id = pointcloud_msg->header.frame_id;
       source_pointcloud_publisher->publish(downsampled_pointcloud_msg);
       time_pointcloud_publish_ms = to_ms(pointcloud_publish_start, Clock::now());
 
+      // measure total callback processing time using overall timer
+      const double total_processing_ms = to_ms(callback_start, Clock::now());
+      const double callback_hz = (total_processing_ms > 1e-6) ? (1000.0 / total_processing_ms) : 0.0;
+      const double lidar_hz = 10.0;  // lidar publishes at 10 Hz
+      const double estimated_max_rosbag_speed = (lidar_hz > 1e-6) ? (callback_hz / lidar_hz) : 0.0;
+
       RCLCPP_INFO(
         this->get_logger(),
-        "pointcloud_callback timing[ms]: transform=%.3f downsample=%.3f debug_msg=%.3f kdtree=%.3f covariance=%.3f voxelmap=%.3f align=%.3f (%2d) publish=%.3f pointcloud_publish=%.3f "
-        "num_points=%zu -> %zu",
+        "pointcloud_callback timing[ms]: transform=%.3f downsample=%.3f debug_msg=%.3f kdtree=%.3f covariance=%.3f voxelmap=%.3f align=%.3f (%2d) publish=%.3f "
+        "pointcloud_publish=%.3f "
+        "num_points=%zu -> %zu total_ms=%.3f estimated_max_rosbag_speed=x%.2f",
         time_transform_ms,
         time_downsample_ms,
         time_debugmsg_ms,
@@ -469,7 +513,9 @@ private:
         time_publish_ms,
         time_pointcloud_publish_ms,
         pcl_pointcloud.points.size(),
-        source_pointcloud->points.size());
+        source_pointcloud->points.size(),
+        total_processing_ms,
+        estimated_max_rosbag_speed);
 
       // RCLCPP_INFO(this->get_logger(), "Small GICP inliers: %zu, iterations: %zu, error: %f", result.num_inliers, result.iterations, result.error);
     } catch (const std::exception& e) {
@@ -498,6 +544,8 @@ private:
   PointCloud::Ptr target_pointcloud;
   KdTree<PointCloud>::Ptr target_tree;
   GaussianVoxelMap::Ptr target_voxelmap;
+  std::shared_ptr<autoware::localization_util::SmartPoseBuffer> pose_buffer;
+  std::shared_ptr<geometry_msgs::msg::PoseWithCovarianceStamped> latest_pose_msg;
 
   std::mutex map_mutex;
   std::atomic<bool> map_processing{false};
@@ -517,6 +565,7 @@ private:
   bool use_downsampling_source = true;
   bool use_downsampling_target = true;
   bool use_voxelmap = true;
+  bool use_interpolated_pose = true;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
   bool initial_pose_received = false;
